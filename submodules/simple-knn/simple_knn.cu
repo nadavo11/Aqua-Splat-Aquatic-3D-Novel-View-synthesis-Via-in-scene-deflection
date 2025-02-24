@@ -23,6 +23,9 @@
 #define __CUDACC__
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+#ifndef FLT_MAX
+#include <float.h>
+#endif
 
 namespace cg = cooperative_groups;
 
