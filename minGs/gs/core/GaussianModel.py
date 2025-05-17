@@ -12,6 +12,35 @@ from gs.helpers.system import mkdir_p
 from gs.helpers.transforms import build_covariance_from_scaling_rotation
 from simple_knn._C import distCUDA2
 from plyfile import PlyData, PlyElement
+import torch.nn.functional as F  # ← NEW
+# --------------------------------------------------------------------------- #
+#  Snell-law warp: many Gaussians wrt one camera (single planar interface)    #
+# --------------------------------------------------------------------------- #
+############
+def refract(points, cam_pos, plane_p, plane_n, eta):
+    """
+    points  : (N,3) Gaussian centres
+    cam_pos : (3,)  camera centre
+    plane_p : (3,)  point on plane
+    plane_n : (3,)  unit normal (faces camera)
+    eta     : (N,1) IOR ratio per Gaussian
+    returns : (N,3) virtual hit points p′
+    """
+    v      = points - cam_pos
+    v_norm = F.normalize(v, dim=-1)
+    plane_n = plane_n / plane_n.norm()
+
+    cos_i  = -(v_norm * plane_n).sum(-1, keepdim=True)
+    sin_t2 = (eta ** 2) * (1 - cos_i ** 2)
+    tir    = sin_t2 > 1.0                           # total internal reflection
+
+    cos_t  = torch.sqrt(torch.clamp(1 - sin_t2, min=0))
+    refr   = eta * v_norm + (eta * cos_i - cos_t) * plane_n
+    refr[tir.squeeze(-1)] = v_norm[tir.squeeze(-1)]
+
+    denom  = (refr * plane_n).sum(-1, keepdim=True).clamp(min=1e-6)
+    t      = ((plane_p - cam_pos) * plane_n).sum() / denom
+    return cam_pos + refr * t
 
 class GaussianModel(nn.Module):
     """
@@ -72,7 +101,21 @@ class GaussianModel(nn.Module):
         self.register_buffer("max_radii2D", max_radii2D, persistent=True)
 
         self.radii = None
-    
+
+        # ── NEW: per-Gaussian deflection parameter η ─────────────────────────
+        init_eta = torch.full((positions.shape[0], 1),
+                              1/1.33, dtype=positions.dtype)
+        self.etas = nn.Parameter(init_eta, requires_grad=False)  # start frozen
+
+        # ── NEW: single planar interface (world space) ───────────────────────
+        self.register_buffer("plane_p",
+                             torch.tensor([0., 0., 0.], dtype=positions.dtype))
+        self.register_buffer("plane_n",
+                             torch.tensor([0., 0., 1.], dtype=positions.dtype))
+
+
+
+
     def forward(self, camera: BaseCamera, active_sh_degree: int=None):
         """
         Render Gaussians to image space with given camera.
@@ -111,8 +154,17 @@ class GaussianModel(nn.Module):
         # Render Gaussians using rasterizer
         rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
+        # --- NEW: refract positions before rasterising ----------------------
+        warped = refract(
+            points=self.positions,
+            cam_pos=camera.camera_center,
+            plane_p=self.plane_p,
+            plane_n=self.plane_n,
+            eta=self.etas,
+        )
+
         rendered_image, self.radii = rasterizer(
-            means3D=self.positions,
+            means3D=warped,
             means2D=self.viewspace_points,
             shs=self.sh_coefficients,
             opacities=self.opacity_activation(self.opacities),
@@ -120,7 +172,18 @@ class GaussianModel(nn.Module):
             rotations=self.rotation_activation(self.rotations),
         )
         return rendered_image
-    
+    # ------------------------------------------------------------------ #
+    #  Public helper: enable learning of η after warm-up                 #
+    # ------------------------------------------------------------------ #
+    def enable_eta_learning(self, lr: float, optimizer):
+        """
+        Call once (e.g. at iter==20_000) to start optimising self.etas.
+        """
+        if self.etas.requires_grad:
+            return
+        self.etas.requires_grad_(True)
+        optimizer.add_param_group({"params": [self.etas], "lr": lr})
+
     def backprop_stats(self):
         """
         Backpropagate stats for densification. Called after loss.backward().
@@ -214,7 +277,20 @@ class GaussianModel(nn.Module):
             sh_degree=self.sh_degree,
             background_color=self.background_color.clone()
         )
-    
+
+    # ------------------------------------------------------------------ #
+    #  Public helper: enable learning of η after warm-up                 #
+    # ------------------------------------------------------------------ #
+    def enable_eta_learning(self, lr: float, optimizer):
+        """
+        Call once (e.g. at iter==20_000) to start optimising self.etas.
+        """
+        if self.etas.requires_grad:
+            return
+        self.etas.requires_grad_(True)
+        optimizer.add_param_group({"params": [self.etas], "lr": lr})
+
+
     def __len__(self):
         return self.positions.shape[0]
     
