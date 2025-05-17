@@ -16,6 +16,7 @@ import torch.nn.functional as F  # ← NEW
 # --------------------------------------------------------------------------- #
 #  Snell-law warp: many Gaussians wrt one camera (single planar interface)    #
 # --------------------------------------------------------------------------- #
+############
 def refract(points, cam_pos, plane_p, plane_n, eta):
     """
     points  : (N,3) Gaussian centres
