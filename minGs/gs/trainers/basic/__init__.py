@@ -103,6 +103,9 @@ def train(
         # We perform a backward pass and update the parameters.
         loss.backward()
         model.backprop_stats()
+        # ======= start the deflection learning ======
+        if pbar == 20_000:
+            model.enable_eta_learning(lr=5e-4, optimizer=optimizer)
 
         with torch.no_grad():
 
