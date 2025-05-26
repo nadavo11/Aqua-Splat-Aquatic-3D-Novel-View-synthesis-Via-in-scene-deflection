@@ -47,7 +47,8 @@ def append_new_gaussians(
         scales: torch.Tensor, 
         opacities: torch.Tensor, 
         sh_coefficients_0: torch.Tensor,
-        sh_coefficients_rest: torch.Tensor
+        sh_coefficients_rest: torch.Tensor,
+        etas: torch.Tensor | None = None
     ) -> None:
     """
     Appends new Gaussians to the model and optimizer.
@@ -59,7 +60,8 @@ def append_new_gaussians(
         "scales": scales,
         "opacities": opacities,
         "sh_coefficients_0": sh_coefficients_0,
-        "sh_coefficients_rest": sh_coefficients_rest
+        "sh_coefficients_rest": sh_coefficients_rest,
+        "etas": etas,
     }
     for group in optimizer.param_groups:
         if len(group["params"]) != 1:
@@ -96,7 +98,8 @@ def clone_gaussians(
     opacities = model.opacities[mask]
     sh_coefficients_0 = model.sh_coefficients_0[mask]
     sh_coefficients_rest = model.sh_coefficients_rest[mask]
-    append_new_gaussians(model, optimizer, positions, rotations, scales, opacities, sh_coefficients_0, sh_coefficients_rest)
+    etas = model.etas[mask]  # ← NEW
+    append_new_gaussians(model, optimizer, positions, rotations, scales, opacities, sh_coefficients_0, sh_coefficients_rest,etas=etas)
     
 def cull_gaussians(
         model: GaussianModel,
@@ -139,6 +142,7 @@ def split_gaussians(
     opacities = model.opacities[mask]
     sh_coefficients_0 = model.sh_coefficients_0[mask]
     sh_coefficients_rest = model.sh_coefficients_rest[mask]
+
     
     # We sample from a normal distribution with a standard deviation of 80% of the original scale.
     sds = model.scaling_activation(scales).repeat(n_samples, 1)
@@ -155,8 +159,9 @@ def split_gaussians(
     new_opacities = opacities.repeat(n_samples, 1)
     new_sh_coefficients_0 = sh_coefficients_0.repeat(n_samples, 1, 1)
     new_sh_coefficients_rest = sh_coefficients_rest.repeat(n_samples, 1, 1)
+    new_etas = model.etas[mask].repeat(n_samples, 1)
 
-    append_new_gaussians(model, optimizer, new_positions, new_rotations, new_scales, new_opacities, new_sh_coefficients_0, new_sh_coefficients_rest)
+    append_new_gaussians(model, optimizer, new_positions, new_rotations, new_scales, new_opacities, new_sh_coefficients_0, new_sh_coefficients_rest,etas=new_etas)
 
     padded_mask = pad_mask(mask, model, device)
     cull_gaussians(model, optimizer, padded_mask) # Remove the original Gaussians

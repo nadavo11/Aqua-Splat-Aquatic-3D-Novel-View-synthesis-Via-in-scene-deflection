@@ -17,30 +17,65 @@ import torch.nn.functional as F  # ← NEW
 #  Snell-law warp: many Gaussians wrt one camera (single planar interface)    #
 # --------------------------------------------------------------------------- #
 ############
-def refract(points, cam_pos, plane_p, plane_n, eta):
+def refract(points, cam_pos, plane_p, plane_n, eta, tol=1e-4):
     """
-    points  : (N,3) Gaussian centres
-    cam_pos : (3,)  camera centre
-    plane_p : (3,)  point on plane
-    plane_n : (3,)  unit normal (faces camera)
-    eta     : (N,1) IOR ratio per Gaussian
-    returns : (N,3) virtual hit points p′
-    """
-    v      = points - cam_pos
-    v_norm = F.normalize(v, dim=-1)
-    plane_n = plane_n / plane_n.norm()
+    Vectorised single-interface refraction.
 
-    cos_i  = -(v_norm * plane_n).sum(-1, keepdim=True)
+    points   : (N,3) Gaussian centres in world space
+    cam_pos  : (3,)  camera centre
+    plane_p  : (3,)  a point on the interface plane
+    plane_n  : (3,)  *unit* normal pointing toward the camera
+    eta      : (N,1) n_incident / n_transmitted  (learnable)
+    tol      : |η-1| below this ⇒ treat as air (no warp)
+
+    Returns   (N,3) virtual positions p′ that the rasteriser will use.
+    """
+
+    # ------------------------------------------------------------------ #
+    # 0.  Normalise + broadcast                                          #
+    # ------------------------------------------------------------------ #
+    n_hat   = plane_n / plane_n.norm()
+    v       = points - cam_pos                    # (N,3) incidents
+    v_norm  = F.normalize(v, dim=-1)
+
+    # ------------------------------------------------------------------ #
+    # 1.  Intersect incident ray with the plane (air side)               #
+    # ------------------------------------------------------------------ #
+    denom_i = (v_norm @ n_hat).unsqueeze(-1)      # (N,1)
+    t_i     = ((plane_p - cam_pos) @ n_hat) / denom_i
+    J       = cam_pos + t_i * v_norm              # (N,3) hit point
+
+    # Guard: rays that never meet the plane (denom≈0 or t_i<0)
+    miss = (denom_i.abs() < 1e-6) | (t_i < 0)
+
+    # ------------------------------------------------------------------ #
+    # 2.  Refracted direction via Snell                                  #
+    # ------------------------------------------------------------------ #
+    cos_i  = -(v_norm @ n_hat).unsqueeze(-1)      # (N,1)
     sin_t2 = (eta ** 2) * (1 - cos_i ** 2)
-    tir    = sin_t2 > 1.0                           # total internal reflection
+    tir    = sin_t2 > 1.0                         # total-internal refl
 
     cos_t  = torch.sqrt(torch.clamp(1 - sin_t2, min=0))
-    refr   = eta * v_norm + (eta * cos_i - cos_t) * plane_n
-    refr[tir.squeeze(-1)] = v_norm[tir.squeeze(-1)]
+    r_dir  = eta * v_norm + (eta * cos_i - cos_t) * n_hat  # (N,3)
+    r_dir  = F.normalize(r_dir, dim=-1)
 
-    denom  = (refr * plane_n).sum(-1, keepdim=True).clamp(min=1e-6)
-    t      = ((plane_p - cam_pos) * plane_n).sum() / denom
-    return cam_pos + refr * t
+    # ------------------------------------------------------------------ #
+    # 3.  Preserve optical depth: move same distance past interface      #
+    # ------------------------------------------------------------------ #
+    L      = (points - J).norm(dim=-1, keepdim=True)        # (N,1)
+    p_prime= J + r_dir * L                                  # (N,3)
+
+    # ------------------------------------------------------------------ #
+    # 4.  Masks                                                          #
+    #     • η ≈ 1      → no bending                                      #
+    #     • miss/TIR   → keep original point (fallback)                  #
+    # ------------------------------------------------------------------ #
+    straight = (eta - 1.0).abs() < tol
+    invalid  = miss.squeeze(-1) | tir.squeeze(-1) | straight.squeeze(-1)
+    p_prime[invalid] = points[invalid]
+
+    return p_prime
+
 
 class GaussianModel(nn.Module):
     """
@@ -103,9 +138,9 @@ class GaussianModel(nn.Module):
         self.radii = None
 
         # ── NEW: per-Gaussian deflection parameter η ─────────────────────────
-        init_eta = torch.full((positions.shape[0], 1),
-                              1/1.33, dtype=positions.dtype)
-        self.etas = nn.Parameter(init_eta, requires_grad=False)  # start frozen
+
+        self.etas = nn.Parameter(torch.ones((positions.shape[0], 1), dtype=positions.dtype),
+                                 requires_grad=True)
 
         # ── NEW: single planar interface (world space) ───────────────────────
         self.register_buffer("plane_p",
@@ -179,10 +214,13 @@ class GaussianModel(nn.Module):
         """
         Call once (e.g. at iter==20_000) to start optimising self.etas.
         """
-        if self.etas.requires_grad:
-            return
+
         self.etas.requires_grad_(True)
-        optimizer.add_param_group({"params": [self.etas], "lr": lr})
+        for g in optimizer.param_groups:
+            if g["name"] == "etas":
+                g["lr"] = 5e-4  # or any value you like
+                print("→ η is now trainable")
+                break
 
     def backprop_stats(self):
         """
@@ -278,17 +316,6 @@ class GaussianModel(nn.Module):
             background_color=self.background_color.clone()
         )
 
-    # ------------------------------------------------------------------ #
-    #  Public helper: enable learning of η after warm-up                 #
-    # ------------------------------------------------------------------ #
-    def enable_eta_learning(self, lr: float, optimizer):
-        """
-        Call once (e.g. at iter==20_000) to start optimising self.etas.
-        """
-        if self.etas.requires_grad:
-            return
-        self.etas.requires_grad_(True)
-        optimizer.add_param_group({"params": [self.etas], "lr": lr})
 
 
     def __len__(self):
@@ -387,7 +414,8 @@ class GaussianModel(nn.Module):
         concatenated_rotations = torch.cat([model.rotations for model in models], dim=0)
         concatenated_scales = torch.cat([model.scales for model in models], dim=0)
         concatenated_opacities = torch.cat([model.opacities for model in models], dim=0)
-        
+        concatenated_etas = torch.cat([model.etas for model in models], dim=0)
+
         # Update current model with concatenated parameters
         self.positions = concatenated_positions
         self.sh_coefficients_0 = concatenated_sh_coefficients_0
@@ -395,6 +423,7 @@ class GaussianModel(nn.Module):
         self.rotations = concatenated_rotations
         self.scales = concatenated_scales
         self.opacities = concatenated_opacities
+        self.etas = concatenated_etas
 
     def save_ply(self, filename: str):
         """
