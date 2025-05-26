@@ -148,7 +148,12 @@ class GaussianModel(nn.Module):
         self.register_buffer("plane_n",
                              torch.tensor([0., 0., 1.], dtype=positions.dtype))
 
-
+        # ── NEW: per-Gaussian surface normal  n̂_i  ──────────────────────────
+        # start each blob pointing +z; requires_grad=False until Stage 2
+        init_normals = torch.tensor([0., 0., 1.], dtype=positions.dtype,
+                                    device=positions.device)  # (3,)
+        init_normals = init_normals.expand_as(self.positions)  # (N,3)
+        self.normals_raw = nn.Parameter(init_normals, requires_grad=False)
 
 
     def forward(self, camera: BaseCamera, active_sh_degree: int=None):
