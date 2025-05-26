@@ -10,10 +10,10 @@ from gs.trainers.basic.helpers import densify, get_expon_lr_func, prune, prune_o
 from gs.visualization.TrainingViewer import TrainingViewer
 
 def train(
-        model: GaussianModel, 
-        cameras: List[BaseCamera], 
-        iterations: int = 5000, 
-        randomize: bool = True, 
+        model: GaussianModel,
+        cameras: List[BaseCamera],
+        iterations: int = 5000,
+        randomize: bool = True,
         positions_lr_init: float = 0.00016,
         positions_lr_final: float = 0.0000016,
         position_lr_delay_mult: float = 0.01,
@@ -104,7 +104,7 @@ def train(
         loss.backward()
         model.backprop_stats()
         # ======= start the deflection learning ======
-        if pbar == 20_000:
+        if i == 20_000:
             model.enable_eta_learning(lr=5e-4, optimizer=optimizer)
 
         with torch.no_grad():
