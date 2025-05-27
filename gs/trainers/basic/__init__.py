@@ -106,7 +106,9 @@ def train(
         # ======= start the deflection learning ======
         if i == 20_000:
             # Enable deflection learning after 20k iterations
-            model.enable_eta_learning(lr=5e-4, optimizer=optimizer)
+            model.enable_eta_learning(lr_eta=5e-4,
+                                      lr_plane=5e-4,
+                                      optimizer=optimizer)
 
         with torch.no_grad():
 

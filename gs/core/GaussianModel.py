@@ -142,18 +142,21 @@ class GaussianModel(nn.Module):
         self.etas = nn.Parameter(torch.ones((positions.shape[0], 1), dtype=positions.dtype),
                                  requires_grad=True)
 
-        # ── NEW: single planar interface (world space) ───────────────────────
-        self.register_buffer("plane_p",
-                             torch.tensor([0., 0., 0.], dtype=positions.dtype))
-        self.register_buffer("plane_n",
-                             torch.tensor([0., 0., 1.], dtype=positions.dtype))
+        # ── GLOBAL interface (learnable) ───────────────────────────────────
+        # plane_p : any point on the pane  (start at origin)
+        self.plane_p = nn.Parameter(
+            torch.tensor([0., 0., 0.], dtype=positions.dtype,
+                         device=positions.device),
+            requires_grad=False  # frozen until Stage 2
+        )
 
-        # ── NEW: per-Gaussian surface normal  n̂_i  ──────────────────────────
-        # start each blob pointing +z; requires_grad=False until Stage 2
-        init_normals = torch.tensor([0., 0., 1.], dtype=positions.dtype,
-                                    device=positions.device)  # (3,)
-        init_normals = init_normals.expand_as(self.positions)  # (N,3)
-        self.normals_raw = nn.Parameter(init_normals, requires_grad=False)
+        # plane_n : raw normal vector     (start +z)
+        self.plane_n_raw = nn.Parameter(
+            torch.tensor([0., 0., 1.], dtype=positions.dtype,
+                         device=positions.device),
+            requires_grad=False  # frozen until Stage 2
+        )
+
 
 
     def forward(self, camera: BaseCamera, active_sh_degree: int=None):
@@ -195,12 +198,14 @@ class GaussianModel(nn.Module):
         rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
         # --- NEW: refract positions before rasterising ----------------------
+        n_hat = torch.nn.functional.normalize(self.plane_n_raw, dim=0)  # (3,)
+
         warped = refract(
             points=self.positions,
             cam_pos=camera.camera_center,
-            plane_p=self.plane_p,
-            plane_n=self.plane_n,
-            eta=self.etas,
+            plane_p=self.plane_p,  # same 3-vector for all blobs
+            plane_n=n_hat.expand_as(self.positions),  # broadcast to (N,3)
+            eta=self.etas
         )
 
         rendered_image, self.radii = rasterizer(
@@ -215,17 +220,26 @@ class GaussianModel(nn.Module):
     # ------------------------------------------------------------------ #
     #  Public helper: enable learning of η after warm-up                 #
     # ------------------------------------------------------------------ #
-    def enable_eta_learning(self, lr: float, optimizer):
+    def enable_eta_learning(self,
+                            optimizer,
+                            lr_eta = 5e-4,
+                            lr_plane = 5e-4):
         """
         Call once (e.g. at iter==20_000) to start optimising self.etas.
         """
 
-        self.etas.requires_grad_(True)
-        for g in optimizer.param_groups:
-            if g["name"] == "etas":
-                g["lr"] = 5e-4  # or any value you like
-                print("→ η is now trainable")
-                break
+        if not self.etas.requires_grad:
+            self.etas.requires_grad_(True)
+            optimizer.add_param_group({"params": [self.etas],
+                                       "lr": lr_eta, "name": "etas"})
+        if not self.plane_p.requires_grad:
+            self.plane_p.requires_grad_(True)
+            optimizer.add_param_group({"params": [self.plane_p],
+                                       "lr": lr_plane, "name": "plane_p"})
+        if not self.plane_n_raw.requires_grad:
+            self.plane_n_raw.requires_grad_(True)
+            optimizer.add_param_group({"params": [self.plane_n_raw],
+                                       "lr": lr_plane, "name": "plane_n"})
 
     def backprop_stats(self):
         """
