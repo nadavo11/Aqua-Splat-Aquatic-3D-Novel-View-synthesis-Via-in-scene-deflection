@@ -156,6 +156,7 @@ class GaussianModel(nn.Module):
                          device=positions.device),
             requires_grad=False  # frozen until Stage 2
         )
+        print(f"AquaGaussianModel initialized with {positions.shape[0]} Gaussians, \nSH degree {sh_degree}, \nbackground color {background_color.tolist()}\n🌊🌊🌊🌊🌊")
 
 
 
@@ -318,7 +319,7 @@ class GaussianModel(nn.Module):
             sh_degree=sh_degree,
             background_color=background_color
         )
-    
+    print("AquaGaussianModel initialized from pointcloud🌊🌊🌊🌊🌊 ")
     # Convenience functions
     
     def clone(self):

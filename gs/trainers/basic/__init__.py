@@ -81,7 +81,7 @@ def train(
         if (i % up_sh_interval == 0) and (active_sh_degree < model.sh_degree) and (i > 0):
             active_sh_degree += 1
 
-        # If we have no cameras to train on, we fill the list with all cameras.
+        # If we have *no* cameras to train on, we fill the list with all cameras.
         if len(train_cameras) == 0:
             train_cameras += reversed(cameras)
             if randomize:
