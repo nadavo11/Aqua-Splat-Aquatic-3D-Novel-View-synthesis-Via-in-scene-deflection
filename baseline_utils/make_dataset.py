@@ -200,6 +200,7 @@ if __name__ == "__main__":
     p.add_argument("--dataset", default="aquarium_dataset", help="output folder name")
     p.add_argument("--overlap", type=int, default=3, help="sequential matcher overlap")
     p.add_argument("--gpu", action="store_true", help="use GPU SIFT + matcher via xvfb")
+    p.add_argument("--from_frames", action="store_true", help="use already extracted .jpg frames")
     args = p.parse_args()
 
     root = Path(args.dataset)
@@ -208,7 +209,11 @@ if __name__ == "__main__":
     db_path = root / "colmap.db"
     root.mkdir(exist_ok=True)
 
-    extract_frames(args.video, img_dir, args.k, args.fps)
+    if not args.from_frames:
+        print(f"extracting frames from {args.video}🎞️")
+        extract_frames(args.video, img_dir, args.k, args.fps)
+
+
 
     colmap_reconstruct(
         img_dir=img_dir,

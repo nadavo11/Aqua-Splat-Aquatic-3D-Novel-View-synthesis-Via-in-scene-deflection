@@ -151,7 +151,7 @@ class GaussianModel(nn.Module):
         )
 
         # plane_n : raw normal vector     (start +z)
-        self.plane_n_raw = nn.Parameter(
+        self.plane_n = nn.Parameter(
             torch.tensor([0., 0., 1.], dtype=positions.dtype,
                          device=positions.device),
             requires_grad=False  # frozen until Stage 2
@@ -199,13 +199,13 @@ class GaussianModel(nn.Module):
         rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
         # --- NEW: refract positions before rasterising ----------------------
-        n_hat = torch.nn.functional.normalize(self.plane_n_raw, dim=0)  # (3,)
+        n_hat = torch.nn.functional.normalize(self.plane_n, dim=0)  # (3,)
 
         warped = refract(
             points=self.positions,
             cam_pos=camera.camera_center,
             plane_p=self.plane_p,  # same 3-vector for all blobs
-            plane_n=n_hat.expand_as(self.positions),  # broadcast to (N,3)
+            plane_n=n_hat, #.expand_as(self.positions),  # broadcast to (N,3)
             eta=self.etas
         )
 
@@ -237,9 +237,9 @@ class GaussianModel(nn.Module):
             self.plane_p.requires_grad_(True)
             optimizer.add_param_group({"params": [self.plane_p],
                                        "lr": lr_plane, "name": "plane_p"})
-        if not self.plane_n_raw.requires_grad:
-            self.plane_n_raw.requires_grad_(True)
-            optimizer.add_param_group({"params": [self.plane_n_raw],
+        if not self.plane_n.requires_grad:
+            self.plane_n.requires_grad_(True)
+            optimizer.add_param_group({"params": [self.plane_n],
                                        "lr": lr_plane, "name": "plane_n"})
 
     def backprop_stats(self):
@@ -462,8 +462,11 @@ class GaussianModel(nn.Module):
         scales = self.scales.detach().cpu().numpy()
         opacities = self.opacities.detach().cpu().numpy()
         sh_coefficients_0 = self.sh_coefficients_0.detach().cpu().squeeze(1).numpy()
-        sh_coefficients_rest = self.sh_coefficients_rest.detach().cpu().view(self.sh_coefficients_rest.shape[0], -1).numpy()
-
+        sh_coefficients_rest = (
+            self.sh_coefficients_rest.detach().cpu()
+            .reshape(self.sh_coefficients_rest.shape[0], -1)  # works on any stride
+            .numpy()
+        )
         # Prepare PLY attributes (order matters!)
         basic_attribs = ['x', 'y', 'z', 'nx', 'ny', 'nz'] # Position and normal attributes
         sh_coefficients_0_attribs = [f'f_dc_{i}' for i in range(self.sh_coefficients_0.shape[1]*self.sh_coefficients_0.shape[2])] # degrees * 3 channels
