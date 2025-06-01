@@ -8,6 +8,9 @@ from gs.helpers.loss import mix_l1_ssim_loss
 from gs.helpers.scene import estimate_scene_scale
 from gs.trainers.basic.helpers import densify, get_expon_lr_func, prune, prune_opacity_only, reset_opacities
 from gs.visualization.TrainingViewer import TrainingViewer
+import imageio
+from gs.trainers.basic.evaluate import eval_model_wandb
+
 
 def train(
         model: GaussianModel,
@@ -34,6 +37,10 @@ def train(
         screen_size_threshold: float = 20,
         world_size_threshold_multiplier: float = 0.1,
         reset_to_opacity: float = 0.01,
+        save_interval: int = 3000,
+        validate_interval: int = 1000,
+        val_cams=None,
+        run=None,
     ):
     """
     This is the most basic trainer for Gaussian splatting. It mirrors the original training logic.
@@ -81,6 +88,7 @@ def train(
         if (i % up_sh_interval == 0) and (active_sh_degree < model.sh_degree) and (i > 0):
             active_sh_degree += 1
 
+
         # If we have *no* cameras to train on, we fill the list with all cameras.
         if len(train_cameras) == 0:
             train_cameras += reversed(cameras)
@@ -124,8 +132,19 @@ def train(
             # Opacity reset
             if (i % opacity_reset_interval == 0) and (i > densify_from_iter):
                 reset_opacities(model, optimizer, reset_to_opacity)
+            #=============================================================
+            #
+            #             validations & saving
+            #
+            #=============================================================
+            if validate_interval and (i % validate_interval == 500) and (val_cams is not None):
+                eval_model_wandb(model=model, val_cams=val_cams, run=run, iter_num=i, project="aqua_gs")
 
-            # We perform the optimization step and zero the gradients
+            if (i % save_interval == 0):
+                model.save_ply(f"./model_{i}.ply")
+
+
+                # We perform the optimization step and zero the gradients
             optimizer.step()
             optimizer.zero_grad(set_to_none=True) # We zero the gradients so they do not accumulate to the next iteration.
 
