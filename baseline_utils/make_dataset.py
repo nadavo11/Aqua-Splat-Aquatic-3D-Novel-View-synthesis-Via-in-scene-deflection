@@ -200,6 +200,8 @@ if __name__ == "__main__":
     p.add_argument("--dataset", default="aquarium_dataset", help="output folder name")
     p.add_argument("--overlap", type=int, default=3, help="sequential matcher overlap")
     p.add_argument("--gpu", action="store_true", help="use GPU SIFT + matcher via xvfb")
+    p.add_argument("--from_frames", action="store_true", help="use .png frames, skip video cutting")
+
     args = p.parse_args()
 
     root = Path(args.dataset)
