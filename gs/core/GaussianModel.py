@@ -137,10 +137,11 @@ class GaussianModel(nn.Module):
 
         self.radii = None
 
-        # ── NEW: per-Gaussian deflection parameter η ─────────────────────────
-
-        self.etas = nn.Parameter(torch.ones((positions.shape[0], 1), dtype=positions.dtype),
-                                 requires_grad=True)
+        # ── SINGLE deflection factor η  (scalar) ───────────────────────────
+        self.eta = nn.Parameter(
+            torch.tensor(1 / 1.33, dtype=positions.dtype, device=positions.device),
+            requires_grad=False  # frozen until Stage 2
+        )
 
         # ── GLOBAL interface (learnable) ───────────────────────────────────
         # plane_p : any point on the pane  (start at origin)
@@ -201,12 +202,15 @@ class GaussianModel(nn.Module):
         # --- NEW: refract positions before rasterising ----------------------
         n_hat = torch.nn.functional.normalize(self.plane_n, dim=0)  # (3,)
 
+        N = self.positions.shape[0]
+        etaB = self.eta.expand(N, 1)  # (N,1) view without copy
+
         warped = refract(
             points=self.positions,
             cam_pos=camera.camera_center,
             plane_p=self.plane_p,  # same 3-vector for all blobs
             plane_n=n_hat, #.expand_as(self.positions),  # broadcast to (N,3)
-            eta=self.etas
+            eta=etaB
         )
 
         rendered_image, self.radii = rasterizer(
@@ -229,10 +233,13 @@ class GaussianModel(nn.Module):
         Call once (e.g. at iter==20_000) to start optimising self.etas.
         """
 
-        if not self.etas.requires_grad:
-            self.etas.requires_grad_(True)
-            optimizer.add_param_group({"params": [self.etas],
-                                       "lr": lr_eta, "name": "etas"})
+        found = False
+        for g in optimizer.param_groups:
+            if g.get("name") == "eta":
+                g["lr"] = lr_eta  # just change LR
+                found = True
+                break
+
         if not self.plane_p.requires_grad:
             self.plane_p.requires_grad_(True)
             optimizer.add_param_group({"params": [self.plane_p],

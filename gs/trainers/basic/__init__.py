@@ -38,7 +38,7 @@ def train(
         world_size_threshold_multiplier: float = 0.1,
         reset_to_opacity: float = 0.01,
         save_interval: int = 3000,
-        validate_interval: int = 1000,
+        validate_interval: int = 0,
         val_cams=None,
         run=None,
     ):
@@ -63,6 +63,7 @@ def train(
         {"params": [model.opacities], "lr": opacities_lr, "name": "opacities"},
         {"params": [model.sh_coefficients_0], "lr": sh_coefficients_lr, "name": "sh_coefficients_0"},
         {"params": [model.sh_coefficients_rest], "lr": sh_coefficients_lr / 20.0, "name": "sh_coefficients_rest"},
+        {"params": [model.eta], "lr": 0.0, "name": "eta"},   # scalar group
     ]
 
     # With all this set, we can define the optimizer.
