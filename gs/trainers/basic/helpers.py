@@ -5,7 +5,7 @@ from torch import nn
 from gs.helpers.math import inverse_sigmoid
 from gs.helpers.transforms import quat_to_rot
 
-from minGS.minGs.example import model
+#from minGS.minGs.example import model
 
 """
 This module contains helper functions for densifying and pruning Gaussian models. It is not attached as a class method since it required direct access to the optimizer.
@@ -74,10 +74,8 @@ def append_new_gaussians(
         # "eta": model.eta if hasattr(model, 'eta') else torch.zeros(1, device=device)  # Default to zero if not present
     }
     for group in optimizer.param_groups:
-        if group["name"] == "eta":  # <─ skip the scalar group
-            print("skipping eta")
+        if group["name"] in ["eta", "plane_p","plane_n"] :  # <─ skip the scalar group
             continue
-        print(group["name"])
         if len(group["params"]) != 1:
             raise ValueError(
                 "Unexpected number of parameters in optimizer group. Only one parameter is expected, as initialized in the GaussianModel.")
@@ -139,6 +137,9 @@ def cull_gaussians(
     """
     keep_mask = ~mask
     for group in optimizer.param_groups:
+
+        if group["name"] in ["eta", "plane_p","plane_n"] :  # <─ skip the scalar group
+            continue
         stored_state = optimizer.state.get(group["params"][0], None)
         if stored_state is not None:
             stored_state["exp_avg"] = stored_state["exp_avg"][keep_mask]

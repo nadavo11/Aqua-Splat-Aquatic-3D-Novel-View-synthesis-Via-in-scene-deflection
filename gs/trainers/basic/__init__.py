@@ -113,7 +113,8 @@ def train(
         loss.backward()
         model.backprop_stats()
         # ======= start the deflection learning ======
-        if i == 20_000:
+        if i == 5_000:
+            print("start rta training")
             # Enable deflection learning after 20k iterations
             model.enable_eta_learning(lr_eta=5e-4,
                                       lr_plane=5e-4,
