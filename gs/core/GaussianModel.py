@@ -77,6 +77,7 @@ def refract(points, cam_pos, plane_p, plane_n, eta, tol=1e-4):
     return p_prime
 
 
+
 class GaussianModel(nn.Module):
     """
     Base class for Gaussian models, represents collection of Gaussians with spherical harmonics coefficients that can be rendered.
@@ -155,7 +156,9 @@ class GaussianModel(nn.Module):
         self.plane_n = nn.Parameter(
             torch.tensor([0., 0., 1.], dtype=positions.dtype,
                          device=positions.device),
-            requires_grad=False  # frozen until Stage 2
+
+
+        requires_grad=False  # frozen until Stage 2
         )
         print(f"AquaGaussianModel initialized with {positions.shape[0]} Gaussians, \nSH degree {sh_degree}, \nbackground color {background_color.tolist()}\n🌊🌊🌊🌊🌊")
 
@@ -222,32 +225,40 @@ class GaussianModel(nn.Module):
             rotations=self.rotation_activation(self.rotations),
         )
         return rendered_image
+
     # ------------------------------------------------------------------ #
     #  Public helper: enable learning of η after warm-up                 #
     # ------------------------------------------------------------------ #
     def enable_eta_learning(self,
                             optimizer,
-                            lr_eta = 5e-4,
-                            lr_plane = 5e-4):
+                            lr_eta: float = 5e-6,  # 1–2 orders smaller is safer
+                            lr_plane: float = 5e-6):
         """
-        Call once (e.g. at iter==20_000) to start optimising self.etas.
+        Switch η, plane_p, plane_n from frozen (lr = 0) to trainable (small lr).
+
+        Call once, e.g. at iter == 20_000.
         """
 
-        found = False
+        # --- keep plane normal unit length before we start updating it
+        with torch.no_grad():
+            self.plane_n.data.div_(self.plane_n.data.norm().clamp(min=1e-8))
+
+        # --- flip requires_grad to True
+        self.eta.requires_grad_(True)
+        self.plane_p.requires_grad_(True)
+        self.plane_n.requires_grad_(True)
+
+        # --- just change the learning-rates inside existing param groups
         for g in optimizer.param_groups:
             if g.get("name") == "eta":
-                g["lr"] = lr_eta  # just change LR
-                found = True
-                break
+                #g["lr"] = lr_eta
+                g["lr"] = 0
+            elif g.get("name") == "plane_p" or g.get("name") == "plane_n":
+                g["lr"] = lr_plane
 
-        if not self.plane_p.requires_grad:
-            self.plane_p.requires_grad_(True)
-            optimizer.add_param_group({"params": [self.plane_p],
-                                       "lr": lr_plane, "name": "plane_p"})
-        if not self.plane_n.requires_grad:
-            self.plane_n.requires_grad_(True)
-            optimizer.add_param_group({"params": [self.plane_n],
-                                       "lr": lr_plane, "name": "plane_n"})
+    def renorm_plane(self):
+        with torch.no_grad():
+            self.plane_n.div_(self.plane_n.norm().clamp(min=1e-8))
 
     def backprop_stats(self):
         """

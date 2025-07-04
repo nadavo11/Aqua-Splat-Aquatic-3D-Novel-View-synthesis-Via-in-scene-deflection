@@ -51,7 +51,7 @@ def eval_model_wandb(model, val_cams, iter_num, run,
 
     # ---- Upload preview (first val view) ----------------------
     first_cam = val_cams[0].to(device)
-    pred = model.forward(first_cam, active_sh_degree=10).clamp(0, 1).cpu().detach().numpy().transpose(1,2,0)
+    pred = model.forward(first_cam, active_sh_degree=model.sh_degree).clamp(0, 1).cpu().detach().numpy().transpose(1,2,0)
     gt   = (first_cam.image.cpu().numpy().transpose(1,2,0) )
     err  = np.abs(pred - gt) / np.maximum(np.abs(pred - gt).max(), 1e-8)
 

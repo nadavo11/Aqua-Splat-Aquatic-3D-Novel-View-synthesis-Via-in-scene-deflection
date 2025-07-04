@@ -63,8 +63,10 @@ def train(
         {"params": [model.opacities], "lr": opacities_lr, "name": "opacities"},
         {"params": [model.sh_coefficients_0], "lr": sh_coefficients_lr, "name": "sh_coefficients_0"},
         {"params": [model.sh_coefficients_rest], "lr": sh_coefficients_lr / 20.0, "name": "sh_coefficients_rest"},
-        {"params": [model.eta], "lr": 0.0, "name": "eta"},   # scalar group
-    ]
+        # ↓↓↓ NEW – already part of the optimizer, but lr = 0 keeps them frozen
+        {"params": [model.eta], "lr": 0.0, "name": "eta"},
+        {"params": [model.plane_n], "lr": 0.0, "name": "plane_n"},
+        {"params": [model.plane_p], "lr": 0.0, "name": "plane_p"}]
 
     # With all this set, we can define the optimizer.
     optimizer = torch.optim.Adam(lr_groups, lr=0.0, eps=1e-15)
@@ -117,7 +119,7 @@ def train(
             print("start rta training")
             # Enable deflection learning after 20k iterations
             model.enable_eta_learning(lr_eta=5e-4,
-                                      lr_plane=5e-4,
+                                      lr_plane=5e-6,
                                       optimizer=optimizer)
 
         with torch.no_grad():
@@ -149,6 +151,7 @@ def train(
                 # We perform the optimization step and zero the gradients
             optimizer.step()
             optimizer.zero_grad(set_to_none=True) # We zero the gradients so they do not accumulate to the next iteration.
+            model.renorm_plane() # We renormalize the plane parameters to avoid numerical issues.
 
             viewer.render_once()
 
