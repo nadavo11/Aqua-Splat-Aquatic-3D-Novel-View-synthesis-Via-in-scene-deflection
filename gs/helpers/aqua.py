@@ -2,7 +2,7 @@ import numpy as np
 import json
 from pathlib import Path
 
-def load_planes(json_path="path/to/config/planes.json"):
+def load_planes(json_path="../planes.json"):
     data = json.loads(Path(json_path).read_text())
     # convert to numpy for speed
     return [
