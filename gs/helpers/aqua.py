@@ -15,7 +15,7 @@ def load_planes(json_path="path/to/config/planes.json"):
       }
       for p in data
     ]
-
+_PLANES = load_planes()
 def refract_dir(I, N, n1, n2):
     # I, N: unit vectors in world—both numpy
     η = n1 / n2
@@ -25,12 +25,33 @@ def refract_dir(I, N, n1, n2):
         return None  # TIR (shouldn’t happen if n1<n2)
     return η*I + (η*cosi - np.sqrt(k))*N
 
+def _symm_to_mat(symm6):
+    # (c00, c01, c02, c11, c12, c22) → full 3×3
+    c00, c01, c02, c11, c12, c22 = symm6
+    return np.array([
+        [c00, c01, c02],
+        [c01, c11, c12],
+        [c02, c12, c22],
+    ], dtype=float)
+
+def _mat_to_symm(mat3):
+    # full 3×3 → (c00, c01, c02, c11, c12, c22)
+    return np.array([
+        mat3[0,0], mat3[0,1], mat3[0,2],
+                   mat3[1,1], mat3[1,2],
+                              mat3[2,2],
+    ], dtype=float)
+
 def apply_refraction_to_gaussian(mean, cov3D, camera, planes=_PLANES):
     """
     mean: numpy (3,), cov3D: numpy (3,3)
     camera: has viewmatrix & projmatrix & camera_center (torch or numpy)
     returns (mean', cov3D') warped through all interfaces
     """
+
+    # unpack if necessary
+    packed = (cov3D.ndim == 1 and cov3D.shape[0] == 6)
+    cov_mat = _symm_to_mat(cov3D) if packed else cov3D.copy()
 
     # 1. build ray direction in world space
     #    a) transform mean → clip space → NDC → pupil ray
@@ -70,5 +91,8 @@ def apply_refraction_to_gaussian(mean, cov3D, camera, planes=_PLANES):
 
     # now propagate mean & covariance
     mean_warped = O + current_D * np.linalg.norm(mean - O)
-    cov_warped = J.dot(cov3D).dot(J.T)
+    cov_warped = J.dot(cov_mat).dot(J.T)
+    if packed:
+        cov_warped = _mat_to_symm(cov_warped)
+
     return mean_warped, cov_warped

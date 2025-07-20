@@ -13,10 +13,13 @@ from gs.helpers.transforms import build_covariance_from_scaling_rotation
 from simple_knn._C import distCUDA2
 from plyfile import PlyData, PlyElement
 from gs.helpers.aqua import load_planes
+import torch.nn.functional as F
+
+
 import json
 from pathlib import Path
 
-from minGS.gs.helpers.aqua import apply_refraction_to_gaussian
+from gs.helpers.aqua import apply_refraction_to_gaussian
 
 # === new helper to load planes.json once ===
 
@@ -83,77 +86,149 @@ class GaussianModel(nn.Module):
         self.radii = None
 
     def forward(self, camera: BaseCamera, active_sh_degree: int = None):
-        """
-        Render Gaussians to image space with given camera.
-        """
+        device = self.positions.device
+
+        # 1) SH degree
         if active_sh_degree is None:
             active_sh_degree = self.sh_degree
         else:
             active_sh_degree = min(active_sh_degree, self.sh_degree)
-        # Update viewspace_points tensor based on position
-        self.viewspace_points = torch.zeros_like(self.positions, dtype=self.positions.dtype, requires_grad=True,
-                                                 device=self.positions.device) + 0
-        try:
-            self.viewspace_points.retain_grad()
-        except Exception as e:
-            pass
 
-        # Calculate camera stats
-        tan_fov_x = math.tan(camera.fov_x * 0.5)
-        tan_fov_y = math.tan(camera.fov_y * 0.5)
+        # 2) Prepare viewspace_points for densification stats
+        self.viewspace_points = torch.zeros_like(
+            self.positions, requires_grad=True, device=device
+        )
+        try: self.viewspace_points.retain_grad()
+        except: pass
 
-        # Create rasterization settings
-        raster_settings = GaussianRasterizationSettings(
-            tanfovx=tan_fov_x,
-            tanfovy=tan_fov_y,
-            viewmatrix=camera.world_view_transform,
-            projmatrix=camera.full_proj_transform,
-            campos=camera.camera_center,
+        # 3) Camera & rasterizer settings
+        tanfovx = math.tan(camera.fov_x * 0.5)
+        tanfovy = math.tan(camera.fov_y * 0.5)
+        rs = GaussianRasterizationSettings(
+            tanfovx=tanfovx,
+            tanfovy=tanfovy,
+            viewmatrix=camera.world_view_transform.to(device),
+            projmatrix=camera.full_proj_transform.to(device),
+            campos=camera.camera_center.to(device),
             sh_degree=active_sh_degree,
             image_height=int(camera.image_height),
             image_width=int(camera.image_width),
-            bg=torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda"),
+            bg=torch.zeros(3, dtype=torch.float32, device=device),
             scale_modifier=1.0,
             prefiltered=False,
             debug=False,
         )
+        rasterizer = GaussianRasterizer(raster_settings=rs)
 
-        # Render Gaussians using rasterizer
-        # === REFRACTION WRAP START ===
-        # 1) Build original 3D covariances from scales & rotations
-        cov3Ds = self.covariance_activation(self.scales, self.rotations)  # Tensor of shape (N, 3, 3)
+        # 4) Build packed covariances (N,6) & unpack to full (N,3,3)
+        cov_symm = build_covariance_from_scaling_rotation(
+            self.scales.to(device),
+            rs.scale_modifier,
+            self.rotations.to(device)
+        ).float()  # → (N,6)
 
-        # 2) Warp each Gaussian through the aquarium interfaces
-        warped_means = []
-        warped_covs = []
-        # camera.camera_center should be a torch tensor; bring it to numpy
-        cam_center = camera.camera_center.detach().cpu().numpy()
-        for mean3d, cov3d in zip(self.positions.detach().cpu().numpy(), cov3Ds.detach().cpu().numpy()):
-            # apply_refraction_to_gaussian should return numpy (3,) and (3,3)
-            mw, cw = apply_refraction_to_gaussian(mean3d, cov3d, camera)
-            warped_means.append(mw)
-            warped_covs.append(cw)
+        # unpack symmetric entries
+        c00, c01, c02, c11, c12, c22 = cov_symm.chunk(6, dim=1)
+        N = cov_symm.shape[0]
+        cov3Ds = cov_symm.new_zeros((N, 3, 3))
+        cov3Ds[:, 0, 0] = c00[:, 0]
+        cov3Ds[:, 0, 1] = cov3Ds[:, 1, 0] = c01[:, 0]
+        cov3Ds[:, 0, 2] = cov3Ds[:, 2, 0] = c02[:, 0]
+        cov3Ds[:, 1, 1] = c11[:, 0]
+        cov3Ds[:, 1, 2] = cov3Ds[:, 2, 1] = c12[:, 0]
+        cov3Ds[:, 2, 2] = c22[:, 0]
 
-        # Stack back into torch tensors on the correct device
-        warped_means = torch.from_numpy(np.stack(warped_means)).to(self.positions.device)
-        warped_covs = torch.from_numpy(np.stack(warped_covs)).to(self.positions.device)
+        # 5) Initialize batched rays & Jacobians
+        O0 = camera.camera_center.to(device).view(1, 3)
+        O = O0.expand(N, 3).clone()  # allocate a fresh tensor
 
-        # 3) Swap in the warped geometry for this forward pass
-        self.positions = nn.Parameter(warped_means)  # override means
-        cov3Ds_precomp = warped_covs  # pass these directly to rasterizer
-        # === REFRACTION WRAP END ===
+        D    = F.normalize(self.positions - O, dim=1)
+        dist = torch.norm(self.positions - O, dim=1, keepdim=True)
+        J    = torch.eye(3, device=device, dtype=torch.float32)\
+                     .unsqueeze(0).repeat(N,1,1)
+        n    = torch.ones(N, device=device, dtype=torch.float32)
 
-        # Now instantiate and call the rasterizer with cov3Ds_precomp instead of scales/rotations:
-        rasterizer = GaussianRasterizer(raster_settings=raster_settings)
-        rendered_image, self.radii = rasterizer(
-            means3D=self.positions,
-            means2D=self.viewspace_points,
-            shs=self.sh_coefficients,
-            opacities=self.opacity_activation(self.opacities),
-            scales=None,
-            rotations=None,
-            cov3Ds_precomp=cov3Ds_precomp
-        )        return rendered_image
+        # 6) Loop over each interface (≈5 planes)
+        for p in _PLANES:
+            origin = torch.tensor(p["origin"], device=device, dtype=torch.float32).view(1,3)
+            normal = torch.tensor(p["normal"], device=device, dtype=torch.float32).view(1,3)
+            n2     = torch.tensor(p["n2"], device=device, dtype=torch.float32)
+
+            denom = (D * normal).sum(dim=1)
+            mask  = denom.abs() > 1e-6
+            t     = ((origin - O) * normal).sum(dim=1) / denom
+            mask &= t > 0
+            if not mask.any():
+                continue
+
+            idx = mask.nonzero(as_tuple=False).squeeze(1)
+            Dm  = D[idx]
+            Nm  = normal.expand_as(Dm)
+            n1  = n[idx]
+
+            η     = (n1 / n2).unsqueeze(1)
+            cosi  = -(Nm * Dm).sum(dim=1, keepdim=True)
+            k     = 1 - η**2 * (1 - cosi**2)
+            sqrtk = torch.sqrt(k)
+            Dp    = η * Dm + (η*cosi - sqrtk) * Nm
+
+            M     = idx.size(0)
+            eye3  = torch.eye(3, device=device, dtype=torch.float32)\
+                         .unsqueeze(0).repeat(M,1,1)
+            A     = η.view(-1,1,1) * eye3
+            B     = ((η*cosi - sqrtk).view(-1,1)*Nm)\
+                        .unsqueeze(2) * Nm.unsqueeze(1)
+            Jr    = A + B
+
+            hit_pt = O[idx] + Dm * t[idx].view(-1,1)
+            O[idx]  = hit_pt + 1e-4 * Dp
+            D[idx]  = Dp
+            J[idx]  = torch.bmm(Jr, J[idx])
+            n[idx]  = n2
+
+        # 7) Warp means & full covariances
+        means_warped = O + D * dist                             # (N,3)
+        covs_warped  = torch.bmm(J, torch.bmm(cov3Ds, J.transpose(1,2)))  # (N,3,3)
+
+        # 8) Re-pack warped covariances to (N,6) for rasterizer
+        c00 = covs_warped[:, 0, 0]
+        c01 = covs_warped[:, 0, 1]
+        c02 = covs_warped[:, 0, 2]
+        c11 = covs_warped[:, 1, 1]
+        c12 = covs_warped[:, 1, 2]
+        c22 = covs_warped[:, 2, 2]
+        covsymm_w = torch.stack([c00, c01, c02, c11, c12, c22], dim=1)  # (N,6)
+
+        # 8) Chunked rasterization to avoid OOM
+        self.positions = nn.Parameter(means_warped)  # keep the override
+
+        N = means_warped.shape[0]
+        H = int(camera.image_height)
+        W = int(camera.image_width)
+
+        accum_image = torch.zeros((3, H, W), device=device)
+        accum_radii = torch.zeros((N, 1), device=device)
+
+        batch_size = 30_000  # tweak down if you still OOM
+
+        for i in range(0, N, batch_size):
+            j = min(i + batch_size, N)
+
+            rendered_chunk, radii_chunk = rasterizer(
+                means3D=means_warped[i:j],
+                means2D=self.viewspace_points[i:j],
+                shs=self.sh_coefficients[i:j],
+                opacities=self.opacity_activation(self.opacities[i:j]),
+                scales=None,
+                rotations=None,
+                cov3D_precomp=covsymm_w[i:j],
+            )
+            accum_image += rendered_chunk
+            accum_radii[i:j] = radii_chunk.view(-1, 1)  # radii_chunk is (N, 1), we need to keep it as a column vector
+
+        # finalize
+        self.radii = accum_radii
+        return accum_image.clamp(0.0, 1.0)
 
     def backprop_stats(self):
         """
@@ -161,20 +236,32 @@ class GaussianModel(nn.Module):
         """
         if self.viewspace_points is None:
             raise ValueError(
-                "viewspace_points is not initialized. Please call forward() before calling update_stats().")
+                "viewspace_points is not initialized. Please call forward() before calling update_stats()."
+            )
         if self.radii is None:
-            raise ValueError("radii is not initialized. Please call forward() before calling update_stats().")
+            raise ValueError(
+                "radii is not initialized. Please call forward() before calling update_stats()."
+            )
 
-        # Now, we calculate per-Gaussian stats that will be useful for densification. It is not directly used in the forward pass.
-        visible_gaussians = self.radii > 0
+        # mask: (N,1), 1 for visible Gaussians, 0 otherwise
+        mask = (self.radii > 0).float()  # still float32, GPU
+
+        # 1) accumulate gradient magnitudes
         if self.viewspace_points.grad is not None:
-            self._gradient_accumulator[visible_gaussians] += torch.norm(
-                self.viewspace_points.grad[visible_gaussians, :2], dim=-1, keepdim=True)
-            self._gradient_accumulator_denominator[
-                visible_gaussians] += 1  # Add 1 to denominator for each point, so we can average the gradient later
+            # grad_xy: (N,2)
+            grad_xy = self.viewspace_points.grad[:, :2]
+            # grad_norm: (N,1)
+            grad_norm = torch.norm(grad_xy, dim=-1, keepdim=True)
+            # weighted add: only visible ones contribute
+            self._gradient_accumulator        += grad_norm * mask
+            self._gradient_accumulator_denominator += mask
 
-        self.max_radii2D[visible_gaussians] = torch.max(self.max_radii2D[visible_gaussians],
-                                                        self.radii[visible_gaussians].unsqueeze(1))
+        # 2) update max radii
+        # new_max = elementwise max of old vs current radii
+        new_max = torch.max(self.max_radii2D, self.radii)
+        # select per-Gaussian: if visible, take new_max, else keep old
+        self.max_radii2D = torch.where(mask.bool(), new_max, self.max_radii2D)
+
 
     @property
     def sh_coefficients(self):
