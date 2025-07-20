@@ -10,10 +10,11 @@ from gs.trainers.basic.helpers import densify, get_expon_lr_func, prune, prune_o
 from gs.visualization.TrainingViewer import TrainingViewer
 import imageio
 from gs.trainers.basic.evaluate import eval_model_wandb
+import csv, torch, lpips, imageio, wandb, numpy as np
 
 
 def train(
-        model: GaussianModel,
+                model: GaussianModel,
         cameras: List[BaseCamera],
         iterations: int = 5000,
         randomize: bool = True,
@@ -47,6 +48,8 @@ def train(
     """
 
     model.to(device)
+    lpips_fn = lpips.LPIPS(net="vgg").to(device).eval()
+
 
     # Prepare model visualizer
     viewer = TrainingViewer(model)
@@ -63,10 +66,7 @@ def train(
         {"params": [model.opacities], "lr": opacities_lr, "name": "opacities"},
         {"params": [model.sh_coefficients_0], "lr": sh_coefficients_lr, "name": "sh_coefficients_0"},
         {"params": [model.sh_coefficients_rest], "lr": sh_coefficients_lr / 20.0, "name": "sh_coefficients_rest"},
-        # ↓↓↓ NEW – already part of the optimizer, but lr = 0 keeps them frozen
-        {"params": [model.eta], "lr": 0.0, "name": "eta"},
-        {"params": [model.plane_n], "lr": 0.0, "name": "plane_n"},
-        {"params": [model.plane_p], "lr": 0.0, "name": "plane_p"}]
+    ]
 
     # With all this set, we can define the optimizer.
     optimizer = torch.optim.Adam(lr_groups, lr=0.0, eps=1e-15)
@@ -91,8 +91,7 @@ def train(
         if (i % up_sh_interval == 0) and (active_sh_degree < model.sh_degree) and (i > 0):
             active_sh_degree += 1
 
-
-        # If we have *no* cameras to train on, we fill the list with all cameras.
+        # If we have no cameras to train on, we fill the list with all cameras.
         if len(train_cameras) == 0:
             train_cameras += reversed(cameras)
             if randomize:
@@ -114,13 +113,6 @@ def train(
         # We perform a backward pass and update the parameters.
         loss.backward()
         model.backprop_stats()
-        # ======= start the deflection learning ======
-        if i == 5_000:
-            print("start rta training")
-            # Enable deflection learning after 20k iterations
-            model.enable_eta_learning(lr_eta=5e-4,
-                                      lr_plane=5e-6,
-                                      optimizer=optimizer)
 
         with torch.no_grad():
 
@@ -137,27 +129,25 @@ def train(
             if (i % opacity_reset_interval == 0) and (i > densify_from_iter):
                 reset_opacities(model, optimizer, reset_to_opacity)
 
-
-
-                # We perform the optimization step and zero the gradients
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True) # We zero the gradients so they do not accumulate to the next iteration.
-            model.renorm_plane() # We renormalize the plane parameters to avoid numerical issues.
-
-            viewer.render_once()
-
-            pbar.set_description(f"Loss: {loss.item()}") # We update the progress bar with the current loss.
-            torch.cuda.empty_cache() # We empty the cache to avoid memory leaks.
-
             #=============================================================
             #
             #             validations & saving
             #
             #=============================================================
             if validate_interval and (i % validate_interval == 500) and (val_cams is not None):
-                eval_model_wandb(model=model, val_cams=val_cams, run=run, iter_num=i, project="aqua_gs")
+                eval_model_wandb(model=model, val_cams=val_cams, run=run, iter_num=i, project="aqua_gs",lpips_fn=lpips_fn)
 
             if (i % save_interval == 0):
                 model.save_ply(f"./model_{i}.ply")
+
+
+            # We perform the optimization step and zero the gradients
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True) # We zero the gradients so they do not accumulate to the next iteration.
+
+            viewer.render_once()
+
+            pbar.set_description(f"Loss: {loss.item()}") # We update the progress bar with the current loss.
+            torch.cuda.empty_cache() # We empty the cache to avoid memory leaks.
 
     viewer.finish_training_keep_alive()
