@@ -38,7 +38,7 @@ def train(
         world_size_threshold_multiplier: float = 0.1,
         reset_to_opacity: float = 0.01,
         save_interval: int = 3000,
-        validate_interval: int = 0,
+        validate_interval: int = 1000,
         val_cams=None,
         run=None,
     ):
@@ -136,16 +136,7 @@ def train(
             # Opacity reset
             if (i % opacity_reset_interval == 0) and (i > densify_from_iter):
                 reset_opacities(model, optimizer, reset_to_opacity)
-            #=============================================================
-            #
-            #             validations & saving
-            #
-            #=============================================================
-            if validate_interval and (i % validate_interval == 500) and (val_cams is not None):
-                eval_model_wandb(model=model, val_cams=val_cams, run=run, iter_num=i, project="aqua_gs")
 
-            if (i % save_interval == 0):
-                model.save_ply(f"./model_{i}.ply")
 
 
                 # We perform the optimization step and zero the gradients
@@ -157,5 +148,16 @@ def train(
 
             pbar.set_description(f"Loss: {loss.item()}") # We update the progress bar with the current loss.
             torch.cuda.empty_cache() # We empty the cache to avoid memory leaks.
+
+            #=============================================================
+            #
+            #             validations & saving
+            #
+            #=============================================================
+            if validate_interval and (i % validate_interval == 500) and (val_cams is not None):
+                eval_model_wandb(model=model, val_cams=val_cams, run=run, iter_num=i, project="aqua_gs")
+
+            if (i % save_interval == 0):
+                model.save_ply(f"./model_{i}.ply")
 
     viewer.finish_training_keep_alive()
