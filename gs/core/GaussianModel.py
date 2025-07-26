@@ -15,6 +15,7 @@ from plyfile import PlyData, PlyElement
 from gs.helpers.aqua import load_planes
 import torch.nn.functional as F
 
+
 import json
 from pathlib import Path
 
@@ -23,7 +24,6 @@ from gs.helpers.aqua import apply_refraction_to_gaussian
 # === new helper to load planes.json once ===
 
 _PLANES = load_planes()
-
 
 class GaussianModel(nn.Module):
     """
@@ -52,14 +52,12 @@ class GaussianModel(nn.Module):
     ):
         super().__init__()
         # Gaussian parameters defining geometry and appearance to be optimized.
-        self.positions = nn.Parameter(positions).float()
+        self.positions = nn.Parameter(positions)
         self.sh_coefficients_0 = nn.Parameter(sh_coefficients[:, :1, :])
         self.sh_coefficients_rest = nn.Parameter(sh_coefficients[:, 1:, :])
-        # ensure everything coming off self is in float32
-
-        self.scales = self.scales.float()
-        self.rotations = self.rotations.float()
-        self.opacities = self.opacities.float()
+        self.rotations = nn.Parameter(rotations)
+        self.scales = nn.Parameter(scales)
+        self.opacities = nn.Parameter(opacities)
 
         # Intermediate variables
         self.sh_degree = sh_degree
@@ -88,125 +86,147 @@ class GaussianModel(nn.Module):
         self.radii = None
 
     def forward(self, camera: BaseCamera, active_sh_degree: int = None):
-        """
-        Simplified forward: only refract Gaussian means (no Jacobian/covariance warping).
-
-        1) Compute refracted means via batched Snell's law.
-        2) Keep original packed covariances.
-        3) Rasterize in chunks to stay GPU-friendly.
-        """
-        import torch.nn.functional as F
         device = self.positions.device
 
-        # -- 1) Select active SH degree
+        # 1) SH degree
         if active_sh_degree is None:
             active_sh_degree = self.sh_degree
         else:
             active_sh_degree = min(active_sh_degree, self.sh_degree)
 
-        # -- 2) Prepare viewspace_points for densification stats
+        # 2) Prepare viewspace_points for densification stats
         self.viewspace_points = torch.zeros_like(
             self.positions, requires_grad=True, device=device
         )
-        try:
-            self.viewspace_points.retain_grad()
-        except:
-            pass
+        try: self.viewspace_points.retain_grad()
+        except: pass
 
-        # -- 3) Build rasterizer settings
+        # 3) Camera & rasterizer settings
         tanfovx = math.tan(camera.fov_x * 0.5)
         tanfovy = math.tan(camera.fov_y * 0.5)
         rs = GaussianRasterizationSettings(
             tanfovx=tanfovx,
             tanfovy=tanfovy,
-            viewmatrix=camera.world_view_transform.to(device).float(),
-            projmatrix=camera.full_proj_transform.to(device).float(),
-            campos=camera.camera_center.to(device).float(),
+            viewmatrix=camera.world_view_transform.to(device),
+            projmatrix=camera.full_proj_transform.to(device),
+            campos=camera.camera_center.to(device),
             sh_degree=active_sh_degree,
             image_height=int(camera.image_height),
             image_width=int(camera.image_width),
-            bg=torch.zeros(3, device=device, dtype=torch.float32),
+            bg=torch.zeros(3, dtype=torch.float32, device=device),
             scale_modifier=1.0,
             prefiltered=False,
             debug=False,
         )
         rasterizer = GaussianRasterizer(raster_settings=rs)
 
-        # -- 4) Get original packed covariances (N,6)
+        # 4) Build packed covariances (N,6) & unpack to full (N,3,3)
         cov_symm = build_covariance_from_scaling_rotation(
-            self.scales.to(device).float(),
+            self.scales.to(device),
             rs.scale_modifier,
-            self.rotations.to(device).float()
-        ).float()
+            self.rotations.to(device)
+        ).float()  # → (N,6)
 
-        # -- 5) Initialize rays
-        N = self.positions.shape[0]
-        O0 = rs.campos.view(1, 3)  # camera center
-        O = O0.expand(N, 3).clone()  # origins per Gaussian
+        # unpack symmetric entries
+        c00, c01, c02, c11, c12, c22 = cov_symm.chunk(6, dim=1)
+        N = cov_symm.shape[0]
+        cov3Ds = cov_symm.new_zeros((N, 3, 3))
+        cov3Ds[:, 0, 0] = c00[:, 0]
+        cov3Ds[:, 0, 1] = cov3Ds[:, 1, 0] = c01[:, 0]
+        cov3Ds[:, 0, 2] = cov3Ds[:, 2, 0] = c02[:, 0]
+        cov3Ds[:, 1, 1] = c11[:, 0]
+        cov3Ds[:, 1, 2] = cov3Ds[:, 2, 1] = c12[:, 0]
+        cov3Ds[:, 2, 2] = c22[:, 0]
 
-        means = self.positions  # (N,3)
-        D = F.normalize(means - O, dim=1)  # directions
-        dist = torch.norm(means - O, dim=1, keepdim=True)
-        n = torch.ones(N, device=device, dtype=torch.float32)
+        # 5) Initialize batched rays & Jacobians
+        O0 = camera.camera_center.to(device).view(1, 3)
+        O = O0.expand(N, 3).clone()  # allocate a fresh tensor
 
-        # -- 6) Refract means through each plane
+        D    = F.normalize(self.positions - O, dim=1)
+        dist = torch.norm(self.positions - O, dim=1, keepdim=True)
+        J    = torch.eye(3, device=device, dtype=torch.float32)\
+                     .unsqueeze(0).repeat(N,1,1)
+        n    = torch.ones(N, device=device, dtype=torch.float32)
+
+        # 6) Loop over each interface (≈5 planes)
         for p in _PLANES:
-            origin = torch.tensor(p['origin'], device=device, dtype=torch.float32).view(1, 3)
-            normal = torch.tensor(p['normal'], device=device, dtype=torch.float32).view(1, 3)
-            n2 = torch.tensor(p['n2'], device=device, dtype=torch.float32)
+            origin = torch.tensor(p["origin"], device=device, dtype=torch.float32).view(1,3)
+            normal = torch.tensor(p["normal"], device=device, dtype=torch.float32).view(1,3)
+            n2     = torch.tensor(p["n2"], device=device, dtype=torch.float32)
 
-            # intersect ray with plane
             denom = (D * normal).sum(dim=1)
-            mask = denom.abs() > 1e-6
-            t = ((origin - O) * normal).sum(dim=1) / denom
+            mask  = denom.abs() > 1e-6
+            t     = ((origin - O) * normal).sum(dim=1) / denom
             mask &= t > 0
             if not mask.any():
                 continue
 
             idx = mask.nonzero(as_tuple=False).squeeze(1)
-            Dm = D[idx]
-            Nm = normal.expand_as(Dm)
-            n1 = n[idx]
+            Dm  = D[idx]
+            Nm  = normal.expand_as(Dm)
+            n1  = n[idx]
 
-            # Snell's law
-            eta = (n1 / n2).unsqueeze(1)
-            cosi = -(Nm * Dm).sum(dim=1, keepdim=True)
-            k = 1 - eta ** 2 * (1 - cosi ** 2)
-            sqrtk = torch.sqrt(k.clamp(min=0))
-            Dp = eta * Dm + (eta * cosi - sqrtk) * Nm
+            η     = (n1 / n2).unsqueeze(1)
+            cosi  = -(Nm * Dm).sum(dim=1, keepdim=True)
+            k     = 1 - η**2 * (1 - cosi**2)
+            sqrtk = torch.sqrt(k)
+            Dp    = η * Dm + (η*cosi - sqrtk) * Nm
 
-            # advance origin
-            hit_pt = O[idx] + Dm * t[idx].unsqueeze(1)
-            O[idx] = hit_pt + 1e-4 * Dp
-            D[idx] = Dp
-            n[idx] = n2
+            M     = idx.size(0)
+            eye3  = torch.eye(3, device=device, dtype=torch.float32)\
+                         .unsqueeze(0).repeat(M,1,1)
+            A     = η.view(-1,1,1) * eye3
+            B     = ((η*cosi - sqrtk).view(-1,1)*Nm)\
+                        .unsqueeze(2) * Nm.unsqueeze(1)
+            Jr    = A + B
 
-        # -- 7) Warp means only
-        means_warped = O + D * dist  # (N,3)
+            hit_pt = O[idx] + Dm * t[idx].view(-1,1)
+            O[idx]  = hit_pt + 1e-4 * Dp
+            D[idx]  = Dp
+            J[idx]  = torch.bmm(Jr, J[idx])
+            n[idx]  = n2
 
-        # -- 8) In-place update of parameters (avoid leaks)
-        with torch.no_grad():
-            self.positions.copy_(means_warped)
+        # 7) Warp means & full covariances
+        means_warped = O + D * dist                             # (N,3)
+        covs_warped  = torch.bmm(J, torch.bmm(cov3Ds, J.transpose(1,2)))  # (N,3,3)
 
-        # -- 9) Chunked rasterization
-        H, W = int(camera.image_height), int(camera.image_width)
+        # 8) Re-pack warped covariances to (N,6) for rasterizer
+        c00 = covs_warped[:, 0, 0]
+        c01 = covs_warped[:, 0, 1]
+        c02 = covs_warped[:, 0, 2]
+        c11 = covs_warped[:, 1, 1]
+        c12 = covs_warped[:, 1, 2]
+        c22 = covs_warped[:, 2, 2]
+        covsymm_w = torch.stack([c00, c01, c02, c11, c12, c22], dim=1)  # (N,6)
+
+        # 8) Chunked rasterization to avoid OOM
+        self.positions = nn.Parameter(means_warped)  # keep the override
+
+        N = means_warped.shape[0]
+        H = int(camera.image_height)
+        W = int(camera.image_width)
+
         accum_image = torch.zeros((3, H, W), device=device)
         accum_radii = torch.zeros((N, 1), device=device)
-        batch_size = 30000
+
+        batch_size = 30_000  # tweak down if you still OOM
+
         for i in range(0, N, batch_size):
             j = min(i + batch_size, N)
-            img_chunk, rad_chunk = rasterizer(
+
+            rendered_chunk, radii_chunk = rasterizer(
                 means3D=means_warped[i:j],
                 means2D=self.viewspace_points[i:j],
                 shs=self.sh_coefficients[i:j],
                 opacities=self.opacity_activation(self.opacities[i:j]),
                 scales=None,
                 rotations=None,
-                cov3Ds_precomp=cov_symm[i:j]
+                cov3D_precomp=covsymm_w[i:j],
             )
-            accum_image += img_chunk
-            accum_radii[i:j] = rad_chunk.view(-1, 1)
+            accum_image += rendered_chunk
+            accum_radii[i:j] = radii_chunk.view(-1, 1)  # radii_chunk is (N, 1), we need to keep it as a column vector
 
+        # finalize
         self.radii = accum_radii
         return accum_image.clamp(0.0, 1.0)
 
@@ -233,7 +253,7 @@ class GaussianModel(nn.Module):
             # grad_norm: (N,1)
             grad_norm = torch.norm(grad_xy, dim=-1, keepdim=True)
             # weighted add: only visible ones contribute
-            self._gradient_accumulator += grad_norm * mask
+            self._gradient_accumulator        += grad_norm * mask
             self._gradient_accumulator_denominator += mask
 
         # 2) update max radii
@@ -241,6 +261,7 @@ class GaussianModel(nn.Module):
         new_max = torch.max(self.max_radii2D, self.radii)
         # select per-Gaussian: if visible, take new_max, else keep old
         self.max_radii2D = torch.where(mask.bool(), new_max, self.max_radii2D)
+
 
     @property
     def sh_coefficients(self):
