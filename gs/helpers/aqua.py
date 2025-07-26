@@ -2,7 +2,7 @@ import numpy as np
 import json
 from pathlib import Path
 
-def load_planes(json_path="path/to/config/planes.json"):
+def load_planes(json_path="/content/Aqua-Splat-Aquatic-3D-Novel-View-synthesis-Via-in-scene-deflection/gs/planes.json"):
     data = json.loads(Path(json_path).read_text())
     # convert to numpy for speed
     return [
@@ -61,16 +61,17 @@ def apply_refraction_to_gaussian(mean, cov3D, camera, planes=_PLANES):
     D /= np.linalg.norm(D)
 
     current_n = 1.0  # start in air
-    current_O, current_D = O, D.copy()
+    current_O, current_D = O, D.copy() # current_O is the origin of the ray, current_D is the direction
     J = np.eye(3)   # accumulated Jacobian
 
     for p in planes:
         N = p["normal"]
         # ray‐plane intersection: t = dot(origin−O, N) / dot(D,N)
         denom = current_D.dot(N)
-        if abs(denom) < 1e-6:
-            continue
-        t = (p["origin"] - current_O).dot(N) / denom
+        if abs(denom) < 1e-6: # ray is parallel to plane
+            continue #TODO why not change current_n? (air -> water)
+
+        t = (p["origin"] - current_O).dot(N) / denom # check if ray hits the plane "before" the origin
         if t < 0:
             continue
         hit = current_O + current_D * t

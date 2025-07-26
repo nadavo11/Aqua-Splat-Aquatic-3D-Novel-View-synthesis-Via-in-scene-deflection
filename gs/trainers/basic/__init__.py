@@ -129,6 +129,11 @@ def train(
             if (i % opacity_reset_interval == 0) and (i > densify_from_iter):
                 reset_opacities(model, optimizer, reset_to_opacity)
 
+            # We perform the optimization step and zero the gradients
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True) # We zero the gradients so they do not accumulate to the next iteration.
+
+
             #=============================================================
             #
             #             validations & saving
@@ -139,11 +144,6 @@ def train(
 
             if (i % save_interval == 0):
                 model.save_ply(f"./model_{i}.ply")
-
-
-            # We perform the optimization step and zero the gradients
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True) # We zero the gradients so they do not accumulate to the next iteration.
 
             viewer.render_once()
 
